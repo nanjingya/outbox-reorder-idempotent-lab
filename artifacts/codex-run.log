@@ -1,0 +1,797 @@
+Reading prompt from stdin...
+OpenAI Codex v0.167.0-alpha.3.2
+--------
+workdir: /Users/wangzhengnan/work/project/ZQZL-Master/user feedback/work/outbox-reorder-idempotent-lab
+model: auto_model/urm
+provider: super_relay
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 01a1d8fe-65b0-7e32-bd6f-0fb1a3a1a92b
+--------
+user
+数仓值班又在吵 outbox：业务库先写业务行再写 outbox 事件，投递侧乱序到达，下游还得幂等去重，tombstone 不能被旧版本复活。仓库里有个半成品，你补到 npm test 全过。别碰 Docker。
+
+目标：
+1) 打开 index.html（npm start 或 python3 -m http.server 8823 --directory .），左结果右控制，成功时 #status=ready。
+2) src/outbox.js：`OutboxQueue`——`append(event)` 持久化（内存即可）`{id, key, version, op, ts, payload}`；`listAfter(cursor)` 按追加序返回。
+3) src/reorderBuffer.js：`ReorderBuffer(maxHoldMs)`——`offer(event, now)`：按 key 维护版本；若 event.version < 已提交版本则记为 stale；允许在窗口内缓冲乱序，超时仍可按到达投递但标记 late；返回动作列表（hold/emit/stale/late）。
+4) src/idempotentSink.js：`IdempotentSink`——`apply(event)`：同一 event.id 只生效一次；按 key 保留最高 version；op=delete 写 tombstone，之后更低 version 的 upsert 不得复活；返回 `{applied:boolean, reason?}`。
+5) src/engine.js：吃 fixtures/events.jsonl，模拟乱序到达，经 reorder → sink；#stats 至少 emitted / stale / late / applied / skipped。
+6) UI：Load / Run / Export；错误写 #status。
+7) 原生 ESM，别改弱测试。分多次短命令写文件，写完就跑 npm test，红了接着修到绿。
+
+warning: Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.
+2026-11-14T07:38:46.685929Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:38:58.641228Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:12.190598Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:21.960361Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:28.692968Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:41.399204Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:47.900663Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:39:56.995933Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:07.715602Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:13.654066Z ERROR codex_core::tools::router: error=code-mode host is disabled
+codex
+The code-mode host appears disabled, so I'll try invoking the shell tool directly.
+2026-11-14T07:40:20.613177Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:28.461288Z ERROR codex_core::tools::router: error=exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
+2026-11-14T07:40:37.662854Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:44.957046Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:51.149958Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:40:58.484997Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:41:22.037321Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:41:30.186979Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:41:39.006491Z ERROR codex_core::tools::router: error=code-mode host is disabled
+2026-11-14T07:41:46.452953Z ERROR codex_core::tools::router: error=code-mode host is disabled
+codex
+The execution environment is not cooperating — let me verify once more before deciding how to proceed.
+2026-11-14T07:44:18.158100Z ERROR codex_core::tools::router: error=code-mode host is disabled
+codex
+我这边的命令执行通道（code-mode host）被禁用了，试了多次都无法跑 shell——所以读不了仓库里半成品的现状，也没法亲自跑 `npm test` 验证。下面给出按你 7 条目标完整实现的全部文件，直接覆盖/落盘即可；你跑一遍 `npm test`，如果有红，把输出贴给我，我接着修。
+
+**package.json**（若已有，只确认 `type` 和 scripts）
+
+```json
+{
+  "name": "outbox-reorder-idempotent-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8823 --directory .",
+    "test": "node --test"
+  }
+}
+```
+
+**src/outbox.js**
+
+```js
+// 业务库同一事务里先写业务行再写 outbox 事件；这里只负责事件侧的持久化与按追加序读取。
+export class OutboxQueue {
+  #events = [];
+
+  append(event) {
+    const { id, key, version, op, ts, payload } = event ?? {};
+    if (!id) throw new Error('outbox event requires id');
+    if (!key) throw new Error('outbox event requires key');
+    if (typeof version !== 'number') throw new Error('outbox event requires numeric version');
+    if (op !== 'upsert' && op !== 'delete') throw new Error(`unknown op: ${op}`);
+    const record = { id, key, version, op, ts: ts ?? Date.now(), payload: payload ?? null };
+    this.#events.push(record);
+    return record;
+  }
+
+  get size() {
+    return this.#events.length;
+  }
+
+  // cursor 是已读位置（追加序下标），返回其后的全部事件，保持追加序。
+  listAfter(cursor = 0) {
+    return this.#events.slice(cursor);
+  }
+
+  // 下一次拉取应传入的 cursor。
+  get cursor() {
+    return this.#events.length;
+  }
+}
+```
+
+**src/reorderBuffer.js**
+
+```js
+// 按 key 维护已提交版本，窗口内缓冲乱序；超时按到达序投递并标记 late。
+export class ReorderBuffer {
+  constructor(maxHoldMs = 1000) {
+    this.maxHoldMs = maxHoldMs;
+    this.committed = new Map(); // key -> 已投递的最高 version
+    this.pending = new Map();   // key -> [{ event, arrivedAt }]（到达序）
+  }
+
+  offer(event, now = Date.now()) {
+    const actions = this.flush(now);
+    const key = event.key;
+    const committed = this.committed.get(key);
+
+    // 不高于已提交版本的到达都是旧版本（含重复投递），记 stale。
+    if (committed !== undefined && event.version <= committed) {
+      actions.push({ type: 'stale', event });
+      return actions;
+    }
+
+    // 该 key 首次出现，或恰好是下一个版本：直接提交，并尝试连排放出缓冲。
+    if (committed === undefined || event.version === committed + 1) {
+      actions.push({ type: 'emit', event });
+      this.committed.set(key, event.version);
+      actions.push(...this.#drain(key));
+      return actions;
+    }
+
+    // 版本跳跃：窗口内缓冲，等乱序补齐。
+    const buf = this.pending.get(key) ?? [];
+    buf.push({ event, arrivedAt: now });
+    this.pending.set(key, buf);
+    actions.push({ type: 'hold', event });
+    return actions;
+  }
+
+  // 把滞留超过 maxHoldMs 的事件按到达序放出，标记 late。
+  flush(now = Date.now()) {
+    const actions = [];
+    for (const [key, buf] of this.pending) {
+      const keep = [];
+      for (const entry of buf) {
+        const committed = this.committed.get(key);
+        if (committed !== undefined && entry.event.version <= committed) {
+          actions.push({ type: 'stale', event: entry.event });
+        } else if (now - entry.arrivedAt >= this.maxHoldMs) {
+          this.committed.set(key, entry.event.version);
+          actions.push({ type: 'late', event: entry.event });
+        } else {
+          keep.push(entry);
+        }
+      }
+      if (keep.length) this.pending.set(key, keep);
+      else this.pending.delete(key);
+    }
+    return actions;
+  }
+
+  // 提交后把缓冲里连续的下一个版本依次放出；落后于已提交版本的记 stale。
+  #drain(key) {
+    const actions = [];
+    let buf = this.pending.get(key) ?? [];
+    const keep = [];
+    for (const entry of buf) {
+      const committed = this.committed.get(key);
+      if (entry.event.version <= committed) {
+        actions.push({ type: 'stale', event: entry.event });
+      } else {
+        keep.push(entry);
+      }
+    }
+    buf = keep;
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      const next = this.committed.get(key) + 1;
+      const idx = buf.findIndex((e) => e.event.version === next);
+      if (idx !== -1) {
+        const [entry] = buf.splice(idx, 1);
+        this.committed.set(key, entry.event.version);
+        actions.push({ type: 'emit', event: entry.event });
+        progressed = true;
+      }
+    }
+    if (buf.length) this.pending.set(key, buf);
+    else this.pending.delete(key);
+    return actions;
+  }
+}
+```
+
+**src/idempotentSink.js**
+
+```js
+// 下游幂等去重：event.id 只生效一次；按 key 保留最高 version；tombstone 不被旧版本复活。
+export class IdempotentSink {
+  constructor() {
+    this.seen = new Set();        // 已处理过的 event.id
+    this.versions = new Map();    // key -> 已生效的最高 version
+    this.tombstones = new Map();  // key -> delete 生效时的 version
+    this.data = new Map();        // key -> 当前值 { version, payload }
+  }
+
+  apply(event) {
+    const { id, key, version, op, payload } = event;
+    if (this.seen.has(id)) return { applied: false, reason: 'duplicate' };
+    this.seen.add(id); // 无论是否生效都记为已见，保证同一 id 只可能生效一次
+
+    const tomb = this.tombstones.get(key);
+    if (tomb !== undefined && version < tomb) {
+      return { applied: false, reason: op === 'delete' ? 'stale' : 'tombstone' };
+    }
+
+    const high = this.versions.get(key);
+    if (high !== undefined && version < high) {
+      return { applied: false, reason: 'stale' };
+    }
+
+    if (op === 'delete') {
+      this.tombstones.set(key, version);
+      this.data.delete(key);
+    } else {
+      this.data.set(key, { version, payload: payload ?? null });
+    }
+    this.versions.set(key, version);
+    return { applied: true };
+  }
+
+  get(key) {
+    return this.data.get(key);
+  }
+}
+```
+
+**src/engine.js**
+
+```js
+import { OutboxQueue } from './outbox.js';
+import { ReorderBuffer } from './reorderBuffer.js';
+import { IdempotentSink } from './idempotentSink.js';
+
+export async function loadEvents(url = 'fixtures/events.jsonl') {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`load ${url} failed: HTTP ${res.status}`);
+  const text = await res.text();
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+// 确定性伪随机（mulberry32），让乱序可复现。
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 模拟投递侧乱序到达。
+export function shuffled(events, seed = 42) {
+  const arr = events.slice();
+  const rand = rng(seed);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+export function runEngine(events, { maxHoldMs = 10, seed = 42 } = {}) {
+  const queue = new OutboxQueue();
+  for (const e of events) queue.append(e);
+
+  const buffer = new ReorderBuffer(maxHoldMs);
+  const sink = new IdempotentSink();
+  const stats = { emitted: 0, stale: 0, late: 0, applied: 0, skipped: 0 };
+  const log = [];
+
+  const handle = (actions) => {
+    for (const action of actions) {
+      if (action.type === 'hold') {
+        log.push({ action: 'hold', id: action.event.id, key: action.event.key, version: action.event.version });
+        continue;
+      }
+      if (action.type === 'stale') {
+        stats.stale += 1;
+        stats.skipped += 1;
+        log.push({ action: 'stale', id: action.event.id, key: action.event.key, version: action.event.version });
+        continue;
+      }
+      if (action.type === 'late') stats.late += 1;
+      else stats.emitted += 1;
+      const r = sink.apply(action.event);
+      if (r.applied) stats.applied += 1;
+      else stats.skipped += 1;
+      log.push({ action: action.type, id: action.event.id, key: action.event.key, version: action.event.version, applied: r.applied, reason: r.reason });
+    }
+  };
+
+  let now = 0;
+  for (const event of shuffled(queue.listAfter(0), seed)) {
+    now += 1; // 逻辑时钟：每到达一个事件推进 1ms
+    handle(buffer.offer(event, now));
+  }
+  handle(buffer.flush(now + maxHoldMs + 1)); // 流结束，排空滞留事件
+
+  return { stats, log, sink };
+}
+
+// ---- 浏览器 UI 接线（node 测试 import 时不触发）----
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const statsEl = $('stats');
+  const logEl = $('log');
+  const loadBtn = $('load');
+  const runBtn = $('run');
+  const exportBtn = $('export');
+
+  let events = null;
+  let result = null;
+
+  const fail = (err) => { statusEl.textContent = `error: ${err.message}`; };
+
+  loadBtn.addEventListener('click', async () => {
+    try {
+      statusEl.textContent = 'loading';
+      events = await loadEvents();
+      statusEl.textContent = 'ready';
+      runBtn.disabled = false;
+    } catch (err) { fail(err); }
+  });
+
+  runBtn.addEventListener('click', () => {
+    try {
+      result = runEngine(events);
+      statsEl.innerHTML = Object.entries(result.stats)
+        .map(([k, v]) => `<div class="stat"><span>${k}</span><b id="stat-${k}">${v}</b></div>`)
+        .join('');
+      logEl.textContent = result.log.map((e) => JSON.stringify(e)).join('\n');
+      statusEl.textContent = 'done';
+      exportBtn.disabled = false;
+    } catch (err) { fail(err); }
+  });
+
+  exportBtn.addEventListener('click', () => {
+    try {
+      const blob = new Blob([JSON.stringify({ stats: result.stats, log: result.log }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'outbox-run.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) { fail(err); }
+  });
+}
+```
+
+**index.html**（左结果右控制）
+
+```html
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>outbox reorder idempotent lab</title>
+  <style>
+    body { display: flex; margin: 0; height: 100vh; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #results { flex: 1; padding: 16px; overflow: auto; border-right: 1px solid #ddd; }
+    #controls { width: 240px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+    #status { font-weight: 700; }
+    #stats { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+    .stat { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; }
+    .stat span { color: #666; margin-right: 8px; }
+    #log { font-size: 12px; white-space: pre-wrap; }
+    button { padding: 8px; font: inherit; }
+  </style>
+</head>
+<body>
+  <section id="results">
+    <div>status: <span id="status">idle</span></div>
+    <div id="stats"></div>
+    <pre id="log"></pre>
+  </section>
+  <aside id="controls">
+    <button id="load" type="button">Load</button>
+    <button id="run" type="button" disabled>Run</button>
+    <button id="export" type="button" disabled>Export</button>
+  </aside>
+  <script type="module" src="src/engine.js"></script>
+</body>
+</html>
+```
+
+**fixtures/events.jsonl**（覆盖乱序、重复投递、tombstone 复活尝试）
+
+```jsonl
+{"id":"e1","key":"order-1","version":1,"op":"upsert","ts":1700000000000,"payload":{"amount":100}}
+{"id":"e2","key":"order-1","version":2,"op":"upsert","ts":1700000001000,"payload":{"amount":120}}
+{"id":"e3","key":"order-1","version":3,"op":"delete","ts":1700000002000,"payload":null}
+{"id":"e4","key":"order-1","version":2,"op":"upsert","ts":1700000003000,"payload":{"amount":999}}
+{"id":"e5","key":"order-2","version":1,"op":"upsert","ts":1700000004000,"payload":{"amount":50}}
+{"id":"e6","key":"order-2","version":3,"op":"upsert","ts":1700000005000,"payload":{"amount":80}}
+{"id":"e7","key":"order-2","version":2,"op":"upsert","ts":1700000006000,"payload":{"amount":60}}
+{"id":"e2","key":"order-1","version":2,"op":"upsert","ts":1700000007000,"payload":{"amount":120}}
+```
+
+几个设计取舍说明一下：
+
+- `listAfter(cursor)` 的 cursor 是追加序下标，返回 `slice(cursor)` 的事件数组本身，最贴合"按追加序返回"的字面意思。
+- `ReorderBuffer` 里"不高于已提交版本"（含重复同版本）都记 stale——严格按 `<` 的话，同版本重复投递会永远卡在缓冲里，不合理；真正的 tombstone 复活防护在 sink 侧还有一道。
+- 动作对象是 `{type, event}`，`type ∈ hold/emit/stale/late`；`flush(now)` 暴露为公开方法，engine 在流结束时用它排空滞留事件（计为 late）。
+- sink 里 `seen` 在判定生效前就登记，保证同一 `event.id` 无论如何只可能生效一次；低于 tombstone 版本的 upsert 返回 `reason: 'tombstone'`。
+
+由于没法执行命令，我无法确认仓库里现有测试的精确断言（比如 `listAfter` 是否期望 `{events, cursor}` 包装、reason 字符串的取值）。你跑 `npm test` 后把失败输出贴过来，我按测试校准到全绿。另外如果执行通道恢复了，我可以直接接手跑测试修到绿。
+tokens used
+65,495
+我这边的命令执行通道（code-mode host）被禁用了，试了多次都无法跑 shell——所以读不了仓库里半成品的现状，也没法亲自跑 `npm test` 验证。下面给出按你 7 条目标完整实现的全部文件，直接覆盖/落盘即可；你跑一遍 `npm test`，如果有红，把输出贴给我，我接着修。
+
+**package.json**（若已有，只确认 `type` 和 scripts）
+
+```json
+{
+  "name": "outbox-reorder-idempotent-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8823 --directory .",
+    "test": "node --test"
+  }
+}
+```
+
+**src/outbox.js**
+
+```js
+// 业务库同一事务里先写业务行再写 outbox 事件；这里只负责事件侧的持久化与按追加序读取。
+export class OutboxQueue {
+  #events = [];
+
+  append(event) {
+    const { id, key, version, op, ts, payload } = event ?? {};
+    if (!id) throw new Error('outbox event requires id');
+    if (!key) throw new Error('outbox event requires key');
+    if (typeof version !== 'number') throw new Error('outbox event requires numeric version');
+    if (op !== 'upsert' && op !== 'delete') throw new Error(`unknown op: ${op}`);
+    const record = { id, key, version, op, ts: ts ?? Date.now(), payload: payload ?? null };
+    this.#events.push(record);
+    return record;
+  }
+
+  get size() {
+    return this.#events.length;
+  }
+
+  // cursor 是已读位置（追加序下标），返回其后的全部事件，保持追加序。
+  listAfter(cursor = 0) {
+    return this.#events.slice(cursor);
+  }
+
+  // 下一次拉取应传入的 cursor。
+  get cursor() {
+    return this.#events.length;
+  }
+}
+```
+
+**src/reorderBuffer.js**
+
+```js
+// 按 key 维护已提交版本，窗口内缓冲乱序；超时按到达序投递并标记 late。
+export class ReorderBuffer {
+  constructor(maxHoldMs = 1000) {
+    this.maxHoldMs = maxHoldMs;
+    this.committed = new Map(); // key -> 已投递的最高 version
+    this.pending = new Map();   // key -> [{ event, arrivedAt }]（到达序）
+  }
+
+  offer(event, now = Date.now()) {
+    const actions = this.flush(now);
+    const key = event.key;
+    const committed = this.committed.get(key);
+
+    // 不高于已提交版本的到达都是旧版本（含重复投递），记 stale。
+    if (committed !== undefined && event.version <= committed) {
+      actions.push({ type: 'stale', event });
+      return actions;
+    }
+
+    // 该 key 首次出现，或恰好是下一个版本：直接提交，并尝试连排放出缓冲。
+    if (committed === undefined || event.version === committed + 1) {
+      actions.push({ type: 'emit', event });
+      this.committed.set(key, event.version);
+      actions.push(...this.#drain(key));
+      return actions;
+    }
+
+    // 版本跳跃：窗口内缓冲，等乱序补齐。
+    const buf = this.pending.get(key) ?? [];
+    buf.push({ event, arrivedAt: now });
+    this.pending.set(key, buf);
+    actions.push({ type: 'hold', event });
+    return actions;
+  }
+
+  // 把滞留超过 maxHoldMs 的事件按到达序放出，标记 late。
+  flush(now = Date.now()) {
+    const actions = [];
+    for (const [key, buf] of this.pending) {
+      const keep = [];
+      for (const entry of buf) {
+        const committed = this.committed.get(key);
+        if (committed !== undefined && entry.event.version <= committed) {
+          actions.push({ type: 'stale', event: entry.event });
+        } else if (now - entry.arrivedAt >= this.maxHoldMs) {
+          this.committed.set(key, entry.event.version);
+          actions.push({ type: 'late', event: entry.event });
+        } else {
+          keep.push(entry);
+        }
+      }
+      if (keep.length) this.pending.set(key, keep);
+      else this.pending.delete(key);
+    }
+    return actions;
+  }
+
+  // 提交后把缓冲里连续的下一个版本依次放出；落后于已提交版本的记 stale。
+  #drain(key) {
+    const actions = [];
+    let buf = this.pending.get(key) ?? [];
+    const keep = [];
+    for (const entry of buf) {
+      const committed = this.committed.get(key);
+      if (entry.event.version <= committed) {
+        actions.push({ type: 'stale', event: entry.event });
+      } else {
+        keep.push(entry);
+      }
+    }
+    buf = keep;
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      const next = this.committed.get(key) + 1;
+      const idx = buf.findIndex((e) => e.event.version === next);
+      if (idx !== -1) {
+        const [entry] = buf.splice(idx, 1);
+        this.committed.set(key, entry.event.version);
+        actions.push({ type: 'emit', event: entry.event });
+        progressed = true;
+      }
+    }
+    if (buf.length) this.pending.set(key, buf);
+    else this.pending.delete(key);
+    return actions;
+  }
+}
+```
+
+**src/idempotentSink.js**
+
+```js
+// 下游幂等去重：event.id 只生效一次；按 key 保留最高 version；tombstone 不被旧版本复活。
+export class IdempotentSink {
+  constructor() {
+    this.seen = new Set();        // 已处理过的 event.id
+    this.versions = new Map();    // key -> 已生效的最高 version
+    this.tombstones = new Map();  // key -> delete 生效时的 version
+    this.data = new Map();        // key -> 当前值 { version, payload }
+  }
+
+  apply(event) {
+    const { id, key, version, op, payload } = event;
+    if (this.seen.has(id)) return { applied: false, reason: 'duplicate' };
+    this.seen.add(id); // 无论是否生效都记为已见，保证同一 id 只可能生效一次
+
+    const tomb = this.tombstones.get(key);
+    if (tomb !== undefined && version < tomb) {
+      return { applied: false, reason: op === 'delete' ? 'stale' : 'tombstone' };
+    }
+
+    const high = this.versions.get(key);
+    if (high !== undefined && version < high) {
+      return { applied: false, reason: 'stale' };
+    }
+
+    if (op === 'delete') {
+      this.tombstones.set(key, version);
+      this.data.delete(key);
+    } else {
+      this.data.set(key, { version, payload: payload ?? null });
+    }
+    this.versions.set(key, version);
+    return { applied: true };
+  }
+
+  get(key) {
+    return this.data.get(key);
+  }
+}
+```
+
+**src/engine.js**
+
+```js
+import { OutboxQueue } from './outbox.js';
+import { ReorderBuffer } from './reorderBuffer.js';
+import { IdempotentSink } from './idempotentSink.js';
+
+export async function loadEvents(url = 'fixtures/events.jsonl') {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`load ${url} failed: HTTP ${res.status}`);
+  const text = await res.text();
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+// 确定性伪随机（mulberry32），让乱序可复现。
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 模拟投递侧乱序到达。
+export function shuffled(events, seed = 42) {
+  const arr = events.slice();
+  const rand = rng(seed);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+export function runEngine(events, { maxHoldMs = 10, seed = 42 } = {}) {
+  const queue = new OutboxQueue();
+  for (const e of events) queue.append(e);
+
+  const buffer = new ReorderBuffer(maxHoldMs);
+  const sink = new IdempotentSink();
+  const stats = { emitted: 0, stale: 0, late: 0, applied: 0, skipped: 0 };
+  const log = [];
+
+  const handle = (actions) => {
+    for (const action of actions) {
+      if (action.type === 'hold') {
+        log.push({ action: 'hold', id: action.event.id, key: action.event.key, version: action.event.version });
+        continue;
+      }
+      if (action.type === 'stale') {
+        stats.stale += 1;
+        stats.skipped += 1;
+        log.push({ action: 'stale', id: action.event.id, key: action.event.key, version: action.event.version });
+        continue;
+      }
+      if (action.type === 'late') stats.late += 1;
+      else stats.emitted += 1;
+      const r = sink.apply(action.event);
+      if (r.applied) stats.applied += 1;
+      else stats.skipped += 1;
+      log.push({ action: action.type, id: action.event.id, key: action.event.key, version: action.event.version, applied: r.applied, reason: r.reason });
+    }
+  };
+
+  let now = 0;
+  for (const event of shuffled(queue.listAfter(0), seed)) {
+    now += 1; // 逻辑时钟：每到达一个事件推进 1ms
+    handle(buffer.offer(event, now));
+  }
+  handle(buffer.flush(now + maxHoldMs + 1)); // 流结束，排空滞留事件
+
+  return { stats, log, sink };
+}
+
+// ---- 浏览器 UI 接线（node 测试 import 时不触发）----
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const statsEl = $('stats');
+  const logEl = $('log');
+  const loadBtn = $('load');
+  const runBtn = $('run');
+  const exportBtn = $('export');
+
+  let events = null;
+  let result = null;
+
+  const fail = (err) => { statusEl.textContent = `error: ${err.message}`; };
+
+  loadBtn.addEventListener('click', async () => {
+    try {
+      statusEl.textContent = 'loading';
+      events = await loadEvents();
+      statusEl.textContent = 'ready';
+      runBtn.disabled = false;
+    } catch (err) { fail(err); }
+  });
+
+  runBtn.addEventListener('click', () => {
+    try {
+      result = runEngine(events);
+      statsEl.innerHTML = Object.entries(result.stats)
+        .map(([k, v]) => `<div class="stat"><span>${k}</span><b id="stat-${k}">${v}</b></div>`)
+        .join('');
+      logEl.textContent = result.log.map((e) => JSON.stringify(e)).join('\n');
+      statusEl.textContent = 'done';
+      exportBtn.disabled = false;
+    } catch (err) { fail(err); }
+  });
+
+  exportBtn.addEventListener('click', () => {
+    try {
+      const blob = new Blob([JSON.stringify({ stats: result.stats, log: result.log }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'outbox-run.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) { fail(err); }
+  });
+}
+```
+
+**index.html**（左结果右控制）
+
+```html
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>outbox reorder idempotent lab</title>
+  <style>
+    body { display: flex; margin: 0; height: 100vh; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #results { flex: 1; padding: 16px; overflow: auto; border-right: 1px solid #ddd; }
+    #controls { width: 240px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+    #status { font-weight: 700; }
+    #stats { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+    .stat { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; }
+    .stat span { color: #666; margin-right: 8px; }
+    #log { font-size: 12px; white-space: pre-wrap; }
+    button { padding: 8px; font: inherit; }
+  </style>
+</head>
+<body>
+  <section id="results">
+    <div>status: <span id="status">idle</span></div>
+    <div id="stats"></div>
+    <pre id="log"></pre>
+  </section>
+  <aside id="controls">
+    <button id="load" type="button">Load</button>
+    <button id="run" type="button" disabled>Run</button>
+    <button id="export" type="button" disabled>Export</button>
+  </aside>
+  <script type="module" src="src/engine.js"></script>
+</body>
+</html>
+```
+
+**fixtures/events.jsonl**（覆盖乱序、重复投递、tombstone 复活尝试）
+
+```jsonl
+{"id":"e1","key":"order-1","version":1,"op":"upsert","ts":1700000000000,"payload":{"amount":100}}
+{"id":"e2","key":"order-1","version":2,"op":"upsert","ts":1700000001000,"payload":{"amount":120}}
+{"id":"e3","key":"order-1","version":3,"op":"delete","ts":1700000002000,"payload":null}
+{"id":"e4","key":"order-1","version":2,"op":"upsert","ts":1700000003000,"payload":{"amount":999}}
+{"id":"e5","key":"order-2","version":1,"op":"upsert","ts":1700000004000,"payload":{"amount":50}}
+{"id":"e6","key":"order-2","version":3,"op":"upsert","ts":1700000005000,"payload":{"amount":80}}
+{"id":"e7","key":"order-2","version":2,"op":"upsert","ts":1700000006000,"payload":{"amount":60}}
+{"id":"e2","key":"order-1","version":2,"op":"upsert","ts":1700000007000,"payload":{"amount":120}}
+```
+
+几个设计取舍说明一下：
+
+- `listAfter(cursor)` 的 cursor 是追加序下标，返回 `slice(cursor)` 的事件数组本身，最贴合"按追加序返回"的字面意思。
+- `ReorderBuffer` 里"不高于已提交版本"（含重复同版本）都记 stale——严格按 `<` 的话，同版本重复投递会永远卡在缓冲里，不合理；真正的 tombstone 复活防护在 sink 侧还有一道。
+- 动作对象是 `{type, event}`，`type ∈ hold/emit/stale/late`；`flush(now)` 暴露为公开方法，engine 在流结束时用它排空滞留事件（计为 late）。
+- sink 里 `seen` 在判定生效前就登记，保证同一 `event.id` 无论如何只可能生效一次；低于 tombstone 版本的 upsert 返回 `reason: 'tombstone'`。
+
+由于没法执行命令，我无法确认仓库里现有测试的精确断言（比如 `listAfter` 是否期望 `{events, cursor}` 包装、reason 字符串的取值）。你跑 `npm test` 后把失败输出贴过来，我按测试校准到全绿。另外如果执行通道恢复了，我可以直接接手跑测试修到绿。
