@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Outbox Reorder Idempotent Lab</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header><h1>Outbox Reorder + Idempotent Sink</h1><div id="status">boot</div></header>
+  <main>
+    <section><pre id="out">load fixtures</pre></section>
+    <aside>
+      <button id="btn-load">Load</button>
+      <button id="btn-run">Run</button>
+      <button id="btn-export">Export</button>
+      <pre id="stats">{}</pre>
+    </aside>
+  </main>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

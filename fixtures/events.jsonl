@@ -1,0 +1,5 @@
+{"id":"e1","key":"u1","version":1,"op":"upsert","ts":1,"arriveTs":1,"payload":{"n":1}}
+{"id":"e3","key":"u1","version":3,"op":"upsert","ts":3,"arriveTs":2,"payload":{"n":3}}
+{"id":"e2","key":"u1","version":2,"op":"upsert","ts":2,"arriveTs":3,"payload":{"n":2}}
+{"id":"e4","key":"u1","version":4,"op":"delete","ts":4,"arriveTs":4,"payload":null}
+{"id":"e2","key":"u1","version":2,"op":"upsert","ts":2,"arriveTs":5,"payload":{"n":2}}
